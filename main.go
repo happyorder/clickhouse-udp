@@ -203,14 +203,14 @@ func insertIntoDb(dbConn *sql.DB, packets []ParsedPacket) {
 		_, err = stmt.Exec(packet.values...)
 
 		if err != nil {
-			fmt.Println("Insert error", err)
+			fmt.Println("Insert error", tableName, err)
 		}
 	}
 
 	err = tx.Commit()
 
 	if err != nil {
-		fmt.Println("commit error", err)
+		fmt.Println("commit error", tableName, err)
 		return
 	}
 }
