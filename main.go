@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,9 +43,7 @@ func startUdpServer(packetQueue chan<- *ParsedPacket) {
 		// log.Println("Received", rlen, "bytes from", remote, "error:", err)
 
 		parsed := parsePacket(buf[:rlen])
-		if parsed != nil {
-			packetQueue <- parsed
-		}
+		packetQueue <- parsed
 	}
 }
 
@@ -80,15 +79,19 @@ func handleTcpConn(conn net.Conn, packetQueue chan<- *ParsedPacket) {
 	const DEADLINE = 30
 
 	headerBuff := make([]byte, 2)
-	payloadBuff := make([]byte, 1024*8)
 	OK := []byte("K")
+	ERROR_RESP := []byte("E")
 
 	for {
 		conn.SetDeadline(time.Now().Add(DEADLINE * time.Second))
 
-		headerLen, err := conn.Read(headerBuff)
+		headerLen, err := io.ReadFull(conn, headerBuff)
 		if err != nil {
-			fmt.Println("Error reading tcp header:", err.Error())
+			if err, ok := err.(net.Error); ok && err.Timeout() {
+				// Timeout error
+			} else {
+				fmt.Println("Error reading tcp header:", err.Error())
+			}
 			return
 		}
 
@@ -99,30 +102,33 @@ func handleTcpConn(conn net.Conn, packetQueue chan<- *ParsedPacket) {
 
 		payloadSize := int(binary.BigEndian.Uint16(headerBuff))
 
-		if payloadSize > len(payloadBuff) {
+		if payloadSize > 1024*8 {
 			fmt.Println("Tcp payload too big", payloadSize)
 			return
 		}
 
-		fmt.Println("Got tcp header with size", payloadSize)
+		// fmt.Println("Got tcp header with size", payloadSize)
 
-		bytesRead, err := io.ReadAtLeast(conn, payloadBuff, (payloadSize))
-
-		fmt.Println("Got tcp payload with size", bytesRead)
-
-		if bytesRead == payloadSize {
-			parsed := parsePacket(payloadBuff[:payloadSize])
-			if parsed != nil {
-				packetQueue <- parsed
-			}
-		}
+		payloadBuff := make([]byte, payloadSize)
+		bytesRead, err := io.ReadFull(conn, payloadBuff)
 
 		if err != nil {
 			fmt.Println("Tcp read error", err)
 			return
 		}
 
-		conn.Write(OK)
+		// fmt.Println("Got tcp payload with size", bytesRead)
+
+		if bytesRead == payloadSize {
+			parsed := parsePacket(payloadBuff[:payloadSize])
+			packetQueue <- parsed
+
+			if parsed != nil {
+				conn.Write(OK)
+			} else {
+				conn.Write(ERROR_RESP)
+			}
+		}
 	}
 }
 
@@ -169,12 +175,26 @@ func main() {
 		startTcpServer(queuedUnparsed)
 	}()
 
+	var failedParses = 0
+	var successParses = 0
+
 	for packet := range queuedUnparsed {
+		if packet == nil {
+			failedParses++
+			continue
+		}
+		successParses++
+
 		key := packet.PacketKey()
 		queuedForSendingMap[key] = append(queuedForSendingMap[key], *packet)
 
 		now := time.Now()
-		if (now.Sub(lastSend)) > (time.Second * 5) {
+		timeSinceLast := now.Sub(lastSend)
+		if timeSinceLast > time.Second*20 {
+			fmt.Println("Flushing", successParses, "rows", failedParses, "packet parse errors")
+			failedParses = 0
+			successParses = 0
+
 			// fmt.Println("Flushing queue of size", len(queuedForSendingMap))
 			lastSend = now
 			for key, queueSet := range queuedForSendingMap {
@@ -221,7 +241,7 @@ func (p *ParsedPacket) PacketKey() string {
 func parsePacket(x []byte) *ParsedPacket {
 	if x[0] != '{' {
 		//fmt.Println("Old log format:", string(x[:150]))
-		return nil
+		return parseOldPacket(string(x))
 	}
 
 	var arbitrary_json map[string]interface{}
@@ -463,4 +483,79 @@ func SplitWithEscaping(s, separator, escape string) []string {
 		tokens[i] = strings.ReplaceAll(token, "\x00", separator)
 	}
 	return tokens
+}
+
+var regColumnName, regErr = regexp.Compile("[^a-zA-Z_]+")
+
+func parseOldPacket(x string) *ParsedPacket {
+	if regErr != nil {
+		log.Fatal(regErr)
+		return nil
+	}
+
+	if !strings.HasSuffix(x, "\n") {
+		fmt.Println("No newline at end")
+		return nil
+	}
+
+	x = strings.TrimSuffix(x, "\n")
+
+	parts := SplitWithEscaping(x, ",", "\\")
+
+	tableName := regColumnName.ReplaceAllString(parts[0], "")
+
+	if tableName == "" {
+		fmt.Println("Table name is empty")
+		return nil
+	}
+
+	isColumn := true
+	columnName := ""
+	items := make([]ColValue, 0, (len(parts)-1)/2)
+
+	for _, v := range parts[1:] {
+		isString := strings.HasPrefix(v, "\"")
+
+		v = strings.ReplaceAll(v, "\\\"", "\x00")
+		v = strings.ReplaceAll(v, "\"", "")
+		v = strings.ReplaceAll(v, "\x00", "\"")
+
+		if isColumn {
+			columnName = regColumnName.ReplaceAllString(v, "")
+		} else {
+			if isString {
+				items = append(items, ColValue{column: columnName, value: v})
+			} else if v == "t" {
+				items = append(items, ColValue{column: columnName, value: true})
+			} else if v == "f" {
+				items = append(items, ColValue{column: columnName, value: false})
+			} else if v == "n" {
+				items = append(items, ColValue{column: columnName, value: nil})
+			} else {
+				parsed, _ := strconv.ParseFloat(v, 32)
+				items = append(items, ColValue{column: columnName, value: parsed})
+			}
+		}
+		isColumn = !isColumn
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].column < items[j].column
+	})
+
+	columns := make([]string, 0, len(items))
+	for _, v := range items {
+		columns = append(columns, v.column)
+	}
+
+	values := make([]interface{}, 0, len(items))
+	for _, v := range items {
+		values = append(values, v.value)
+	}
+
+	return &ParsedPacket{
+		tableName: tableName,
+		columns:   columns,
+		values:    values,
+	}
 }
