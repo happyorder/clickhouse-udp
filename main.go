@@ -220,7 +220,7 @@ func (p *ParsedPacket) PacketKey() string {
 
 func parsePacket(x []byte) *ParsedPacket {
 	if x[0] != '{' {
-		fmt.Println("Old log format:", string(x[:120]))
+		//fmt.Println("Old log format:", string(x[:150]))
 		return nil
 	}
 
