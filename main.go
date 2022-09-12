@@ -87,10 +87,10 @@ func handleTcpConn(conn net.Conn, packetQueue chan<- *ParsedPacket) {
 
 		headerLen, err := io.ReadFull(conn, headerBuff)
 		if err != nil {
-			if err, ok := err.(net.Error); ok && err.Timeout() {
-				// Timeout error
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				fmt.Println("Tcp client timed out")
 			} else {
-				fmt.Println("Error reading tcp header:", err.Error())
+				fmt.Println("Error reading tcp header:", err)
 			}
 			return
 		}
@@ -124,9 +124,14 @@ func handleTcpConn(conn net.Conn, packetQueue chan<- *ParsedPacket) {
 			packetQueue <- parsed
 
 			if parsed != nil {
-				conn.Write(OK)
+				_, err = conn.Write(OK)
 			} else {
-				conn.Write(ERROR_RESP)
+				_, err = conn.Write(ERROR_RESP)
+			}
+
+			if err != nil {
+				fmt.Println("Tcp write error", err)
+				return
 			}
 		}
 	}
@@ -149,7 +154,8 @@ func main() {
 	})
 
 	if err != nil {
-		log.Fatal(err)
+		log.Panicln(err)
+		return
 	}
 	defer dbConn.Close()
 
@@ -206,9 +212,16 @@ func main() {
 					}
 				}
 
-				if len(columnInfo) > 0 {
+				if queueSet != nil && len(columnInfo) > 0 {
 					go func(innerQueueSet []ParsedPacket) {
-						insertIntoDb(dbConn, innerQueueSet, columnInfo)
+						for i := 0; i < 5; i++ {
+							shouldRetry := insertIntoDb(dbConn, innerQueueSet, columnInfo)
+							if !shouldRetry {
+								return
+							}
+							fmt.Println("Retrying insert in 5 seconds")
+							time.Sleep(time.Second * 5)
+						}
 					}(queueSet)
 				}
 
@@ -252,10 +265,15 @@ func parsePacket(x []byte) *ParsedPacket {
 		return nil
 	}
 
-	tableName := arbitrary_json["_t"].(string)
+	if arbitrary_json == nil {
+		fmt.Println("Parse json returned nil")
+		return nil
+	}
+
+	tableName, tableNameOk := arbitrary_json["_t"].(string)
 	delete(arbitrary_json, "_t")
 
-	if tableName == "" {
+	if !tableNameOk || tableName == "" {
 		fmt.Println("Table name is empty")
 		return nil
 	}
@@ -338,14 +356,34 @@ WHERE database = 'default'`)
 	return result, err
 }
 
-func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTableAndName) {
+func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTableAndName) bool {
 	columnNames := rows[0].columns
 	tableName := rows[0].tableName
 	columns := columnInfo[tableName]
 
 	if columns == nil {
 		fmt.Println("No column info found for table", tableName)
-		return
+		return false
+	}
+
+	if len(columns) != len(columnNames) {
+		fmt.Println("Column missmatch in", tableName)
+
+		columnNameMap := make(map[string]bool)
+		for _, v := range columnNames {
+			columnNameMap[v] = true
+			if _, ok := columns[v]; !ok {
+				fmt.Println("Packet col does not exist in db", tableName, v)
+			}
+		}
+
+		for key := range columns {
+			if _, ok := columnNameMap[key]; !ok {
+				fmt.Println("Db column missing from packet", tableName, key)
+			}
+		}
+
+		return false
 	}
 
 	// fmt.Println("Inserting", len(rows), "rows into", tableName, "...")
@@ -354,7 +392,12 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 
 	if err != nil {
 		fmt.Println("Could not start transaction", err)
-		return
+		return true
+	}
+
+	if tx == nil {
+		fmt.Println("Could not start transaction")
+		return true
 	}
 
 	defer tx.Abort()
@@ -367,7 +410,7 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 
 			if col == nil {
 				fmt.Println("Col is nil", tableName, colName)
-				return
+				return true
 			}
 
 			// fmt.Println("Converting column", colName, "to", colInfo.ColType)
@@ -404,7 +447,7 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 				err = col.Append(items)
 				if err != nil {
 					fmt.Println("Add column error", tableName, err)
-					return
+					return true
 				}
 			} else if colInfo.ColType == "String" {
 				items := make([]string, len(rows))
@@ -427,7 +470,7 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 				err = col.Append(items)
 				if err != nil {
 					fmt.Println("Add column error", tableName, err)
-					return
+					return true
 				}
 			} else if colInfo.ColType == "DateTime" {
 				items := make([]time.Time, len(rows))
@@ -453,11 +496,113 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 				err = col.Append(items)
 				if err != nil {
 					fmt.Println("Add column error", tableName, err)
-					return
+					return true
+				}
+			} else if colInfo.ColType == "UInt16" {
+				items := make([]uint16, len(rows))
+				for i, row := range rows {
+					val := row.values[colIndex]
+					switch v := val.(type) {
+					case int:
+					case int64:
+					case float32:
+					case float64:
+						items[i] = uint16(v)
+					case bool:
+						if v {
+							items[i] = 1
+						} else {
+							items[i] = 0
+						}
+					case string:
+						v2, err := strconv.ParseUint(v, 10, 16)
+						if err == nil {
+							items[i] = uint16(v2)
+						} else {
+							items[i] = 0
+							fmt.Println("Invalid uint16 number", tableName, colName, v)
+						}
+					default:
+						items[i] = 0
+						fmt.Println("Invalid col conversion", tableName, colName, v)
+					}
+				}
+				err = col.Append(items)
+				if err != nil {
+					fmt.Println("Add column error", tableName, err)
+					return true
+				}
+			} else if colInfo.ColType == "UInt32" {
+				items := make([]uint32, len(rows))
+				for i, row := range rows {
+					val := row.values[colIndex]
+					switch v := val.(type) {
+					case int:
+					case int64:
+					case float32:
+					case float64:
+						items[i] = uint32(v)
+					case bool:
+						if v {
+							items[i] = 1
+						} else {
+							items[i] = 0
+						}
+					case string:
+						v2, err := strconv.ParseUint(v, 10, 32)
+						if err == nil {
+							items[i] = uint32(v2)
+						} else {
+							items[i] = 0
+							fmt.Println("Invalid uint32 number", tableName, colName, v)
+						}
+					default:
+						items[i] = 0
+						fmt.Println("Invalid col conversion", tableName, colName, v)
+					}
+				}
+				err = col.Append(items)
+				if err != nil {
+					fmt.Println("Add column error", tableName, err)
+					return true
+				}
+			} else if colInfo.ColType == "UInt64" {
+				items := make([]uint64, len(rows))
+				for i, row := range rows {
+					val := row.values[colIndex]
+					switch v := val.(type) {
+					case int:
+					case int64:
+					case float32:
+					case float64:
+						items[i] = uint64(v)
+					case bool:
+						if v {
+							items[i] = 1
+						} else {
+							items[i] = 0
+						}
+					case string:
+						v2, err := strconv.ParseUint(v, 10, 64)
+						if err == nil {
+							items[i] = uint64(v2)
+						} else {
+							items[i] = 0
+							fmt.Println("Invalid uint64 number", tableName, colName, v)
+						}
+					default:
+						items[i] = 0
+						fmt.Println("Invalid col conversion", tableName, colName, v)
+					}
+				}
+				err = col.Append(items)
+				if err != nil {
+					fmt.Println("Add column error", tableName, err)
+					return true
 				}
 			} else {
 				fmt.Println("Unknown column type", tableName, colInfo.ColType)
-				return
+				return true
 			}
 		} else {
 			fmt.Println("Column does not exist in db table", tableName, colName)
@@ -470,10 +615,11 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 
 	if err != nil {
 		fmt.Println("Commit error", tableName, err)
-		return
+		return true
 	}
 
-	// fmt.Println("Saved", len(rows), "columns to", tableName)
+	fmt.Println("Saved", len(rows), "rows to", tableName)
+	return false
 }
 
 func SplitWithEscaping(s, separator, escape string) []string {
@@ -532,8 +678,12 @@ func parseOldPacket(x string) *ParsedPacket {
 			} else if v == "n" {
 				items = append(items, ColValue{column: columnName, value: nil})
 			} else {
-				parsed, _ := strconv.ParseFloat(v, 32)
-				items = append(items, ColValue{column: columnName, value: parsed})
+				parsed, err := strconv.ParseFloat(v, 32)
+				if err == nil {
+					items = append(items, ColValue{column: columnName, value: parsed})
+				} else {
+					fmt.Println("Old format col error", tableName, columnName)
+				}
 			}
 		}
 		isColumn = !isColumn
