@@ -346,7 +346,7 @@ WHERE database = 'default'`)
 		result[table][name] = ColumnInfo{
 			Table:    table,
 			Position: pos,
-			ColType:  strings.Replace(strings.Replace(strings.Replace(colType, ")", "", 1), "LowCardinality(", "", 1), "Nullable(", "", 1),
+			ColType:  strings.Replace(strings.Replace(strings.Replace(strings.Replace(colType, "(3)", "", 1), ")", "", 1), "LowCardinality(", "", 1), "Nullable(", "", 1),
 			Name:     name,
 		}
 	}
@@ -472,7 +472,7 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 					fmt.Println("Add column error", tableName, err)
 					return true
 				}
-			} else if colInfo.ColType == "DateTime" {
+			} else if colInfo.ColType == "DateTime" || colInfo.ColType == "DateTime64" {
 				items := make([]time.Time, len(rows))
 				for i, row := range rows {
 					val := row.values[colIndex]
