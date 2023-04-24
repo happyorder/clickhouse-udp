@@ -566,6 +566,40 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 					fmt.Println("Add column error", tableName, err)
 					return true
 				}
+			} else if colInfo.ColType == "Int32" {
+				items := make([]int32, len(rows))
+				for i, row := range rows {
+					val := row.values[colIndex]
+					switch v := val.(type) {
+					case int:
+					case int64:
+					case float32:
+					case float64:
+						items[i] = int32(v)
+					case bool:
+						if v {
+							items[i] = 1
+						} else {
+							items[i] = 0
+						}
+					case string:
+						v2, err := strconv.ParseInt(v, 10, 32)
+						if err == nil {
+							items[i] = int32(v2)
+						} else {
+							items[i] = 0
+							fmt.Println("Invalid int32 number", tableName, colName, v)
+						}
+					default:
+						items[i] = 0
+						fmt.Println("Invalid col conversion", tableName, colName, v)
+					}
+				}
+				err = col.Append(items)
+				if err != nil {
+					fmt.Println("Add column error", tableName, err)
+					return true
+				}
 			} else if colInfo.ColType == "UInt8" {
 				items := make([]uint8, len(rows))
 				for i, row := range rows {
