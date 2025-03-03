@@ -88,7 +88,9 @@ func handleTcpConn(conn net.Conn, packetQueue chan<- *ParsedPacket) {
 		headerLen, err := io.ReadFull(conn, headerBuff)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				fmt.Println("Tcp client timed out")
+				// fmt.Println("Tcp client timed out")
+			} else if err == io.EOF {
+				// This is normal, we just want to exit
 			} else {
 				fmt.Println("Error reading tcp header:", err)
 			}
