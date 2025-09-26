@@ -8,21 +8,196 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"os/signal"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 )
 
-func startUdpServer(packetQueue chan<- *ParsedPacket) {
+type ParsedPacket struct {
+	tableName string
+	columns   []string
+	values    []interface{}
+}
+
+type ColValue struct {
+	column string
+	value  interface{}
+}
+
+type DbTableColumnMap = map[string]map[string]ColumnInfo
+
+type CurrentDbSchema struct {
+	Schema *DbTableColumnMap
+}
+
+type ColumnInfo struct {
+	Table    string
+	ColType  string
+	Name     string
+	Position uint64
+}
+
+func (p *ParsedPacket) PacketKey() string {
+	return fmt.Sprintf("%s:%s", p.tableName, strings.Join(p.columns, ","))
+}
+
+func main() {
+	exitCtx, _ := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+
+	var dbConn, err = clickhouse.Open(&clickhouse.Options{
+		Addr: []string{"127.0.0.1:9000"},
+		Auth: clickhouse.Auth{
+			Database: "default",
+			Username: "default",
+			Password: "",
+		},
+		//Debug:           true,
+		DialTimeout:     time.Second,
+		MaxOpenConns:    10,
+		MaxIdleConns:    5,
+		ConnMaxLifetime: time.Hour,
+	})
+
+	if err != nil {
+		log.Panicln(err)
+		return
+	}
+	defer dbConn.Close()
+
+	schema, err := fetchClickhouseSchema(dbConn)
+	if err != nil {
+		if exception, ok := err.(*clickhouse.Exception); ok {
+			log.Panicf("[%d] %s \n%s\n", exception.Code, exception.Message, exception.StackTrace)
+		} else {
+			log.Panicln(err)
+		}
+		return
+	}
+
+	currentSchema := CurrentDbSchema{
+		Schema: &schema,
+	}
+	queuedUnparsed := make(chan *ParsedPacket, 5000)
+	wg := &sync.WaitGroup{}
+
+	go func() {
+		startUdpServer(exitCtx, queuedUnparsed)
+	}()
+
+	go func() {
+		startTcpServer(exitCtx, queuedUnparsed)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		createLogsSaveThread(exitCtx, dbConn, currentSchema, queuedUnparsed, 30*time.Second, 2000)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		updateDbSchemaThread(exitCtx, dbConn, currentSchema)
+	}()
+
+	wg.Wait()
+}
+
+func updateDbSchemaThread(exitCtx context.Context, dbConn driver.Conn, currentSchema CurrentDbSchema) {
+	for {
+		time.Sleep(time.Minute * 10)
+
+		select {
+		case <-exitCtx.Done():
+			return
+
+		default:
+			schema, err := fetchClickhouseSchema(dbConn)
+			if err != nil {
+				if exception, ok := err.(*clickhouse.Exception); ok {
+					log.Printf("fetchClickhouseSchema error [%d] %s \n%s\n", exception.Code, exception.Message, exception.StackTrace)
+				} else {
+					log.Println("fetchClickhouseSchema error", err)
+				}
+			} else {
+				currentSchema.Schema = &schema
+			}
+		}
+	}
+}
+
+func createLogsSaveThread(interruptCtx context.Context, clickh clickhouse.Conn, schema CurrentDbSchema, values <-chan *ParsedPacket, maxTimeout time.Duration, maxItems int) {
+	isExiting := false
+
+	for {
+		var queueByTable = make(map[string][]*ParsedPacket)
+		expire := time.After(maxTimeout)
+
+		for {
+			select {
+			case value, ok := <-values:
+				if !ok {
+					goto sendBatch
+				}
+				tableKey := value.PacketKey()
+				packetList := append(queueByTable[tableKey], value)
+				queueByTable[tableKey] = packetList
+
+				if len(packetList) >= maxItems {
+					goto sendBatch
+				}
+
+			case <-expire:
+				goto sendBatch
+
+			case <-interruptCtx.Done():
+				isExiting = true
+				goto sendBatch
+			}
+		}
+
+	sendBatch:
+
+		for tableKey, rows := range queueByTable {
+			if len(rows) == 0 {
+				continue
+			}
+
+			delete(queueByTable, tableKey)
+
+			fmt.Println("Saving batch of", len(rows), "to table", rows[0].tableName)
+
+			for i := 0; i < 5; i++ {
+				shouldRetry := insertIntoDb(clickh, rows, *schema.Schema)
+				if !shouldRetry {
+					return
+				}
+				fmt.Println("Retrying insert in 5 seconds")
+				time.Sleep(time.Second * 5)
+			}
+		}
+
+		if isExiting {
+			return
+		}
+	}
+}
+
+func startUdpServer(exitCtx context.Context, packetQueue chan<- *ParsedPacket) {
 	addr := net.UDPAddr{
 		Port: 9030,
 		IP:   net.ParseIP("0.0.0.0"),
 	}
+
 	conn, err := net.ListenUDP("udp", &addr)
 	if err != nil {
 		panic(err)
@@ -47,7 +222,7 @@ func startUdpServer(packetQueue chan<- *ParsedPacket) {
 	}
 }
 
-func startTcpServer(packetQueue chan<- *ParsedPacket) {
+func startTcpServer(exitCtx context.Context, packetQueue chan<- *ParsedPacket) {
 	addr := net.TCPAddr{
 		Port: 9030,
 		IP:   net.ParseIP("0.0.0.0"),
@@ -139,184 +314,7 @@ func handleTcpConn(conn net.Conn, packetQueue chan<- *ParsedPacket) {
 	}
 }
 
-func main() {
-	var ctx = context.Background()
-	var dbConn, err = clickhouse.Open(&clickhouse.Options{
-		Addr: []string{"127.0.0.1:9000"},
-		Auth: clickhouse.Auth{
-			Database: "default",
-			Username: "default",
-			Password: "",
-		},
-		//Debug:           true,
-		DialTimeout:     time.Second,
-		MaxOpenConns:    10,
-		MaxIdleConns:    5,
-		ConnMaxLifetime: time.Hour,
-	})
-
-	if err != nil {
-		log.Panicln(err)
-		return
-	}
-	defer dbConn.Close()
-
-	if err := dbConn.Ping(ctx); err != nil {
-		if exception, ok := err.(*clickhouse.Exception); ok {
-			fmt.Printf("[%d] %s \n%s\n", exception.Code, exception.Message, exception.StackTrace)
-		} else {
-			fmt.Println(err)
-		}
-		return
-	}
-
-	queuedForSendingMap := make(map[string][]ParsedPacket)
-	queuedUnparsed := make(chan *ParsedPacket, 100)
-	lastSend := time.Now()
-	columnInfo := make(ColumnByTableAndName)
-
-	go func() {
-		startUdpServer(queuedUnparsed)
-	}()
-
-	go func() {
-		startTcpServer(queuedUnparsed)
-	}()
-
-	var failedParses = 0
-	var successParses = 0
-
-	for packet := range queuedUnparsed {
-		if packet == nil {
-			failedParses++
-			continue
-		}
-		successParses++
-
-		key := packet.PacketKey()
-		queuedForSendingMap[key] = append(queuedForSendingMap[key], *packet)
-
-		now := time.Now()
-		timeSinceLast := now.Sub(lastSend)
-		if timeSinceLast > time.Second*20 {
-			fmt.Println("Flushing", successParses, "rows", failedParses, "packet parse errors")
-			failedParses = 0
-			successParses = 0
-
-			// fmt.Println("Flushing queue of size", len(queuedForSendingMap))
-			lastSend = now
-			for key, queueSet := range queuedForSendingMap {
-				if len(columnInfo) == 0 {
-					columnInfo, err = fetchColumnOrder(dbConn)
-
-					if err != nil {
-						fmt.Println("Could not get columns", err)
-					}
-				}
-
-				if queueSet != nil && len(columnInfo) > 0 {
-					go func(innerQueueSet []ParsedPacket) {
-						for i := 0; i < 5; i++ {
-							shouldRetry := insertIntoDb(dbConn, innerQueueSet, columnInfo)
-							if !shouldRetry {
-								return
-							}
-							fmt.Println("Retrying insert in 5 seconds")
-							time.Sleep(time.Second * 5)
-						}
-					}(queueSet)
-				}
-
-				delete(queuedForSendingMap, key)
-			}
-
-			for range queuedForSendingMap {
-				fmt.Println("QUEUE IS NOT EMPTY AFTER FLUSH")
-			}
-		}
-
-	}
-}
-
-type ParsedPacket struct {
-	tableName string
-	columns   []string
-	values    []interface{}
-}
-
-type ColValue struct {
-	column string
-	value  interface{}
-}
-
-func (p *ParsedPacket) PacketKey() string {
-	return fmt.Sprintf("%s:%s", p.tableName, strings.Join(p.columns, ","))
-}
-
-func parsePacket(x []byte) *ParsedPacket {
-	if x[0] != '{' {
-		//fmt.Println("Old log format:", string(x[:150]))
-		return parseOldPacket(string(x))
-	}
-
-	var arbitrary_json map[string]interface{}
-	err := json.Unmarshal([]byte(x), &arbitrary_json)
-
-	if err != nil {
-		fmt.Println("Parse packet error", err)
-		return nil
-	}
-
-	if arbitrary_json == nil {
-		fmt.Println("Parse json returned nil")
-		return nil
-	}
-
-	tableName, tableNameOk := arbitrary_json["_t"].(string)
-	delete(arbitrary_json, "_t")
-
-	if !tableNameOk || tableName == "" {
-		fmt.Println("Table name is empty")
-		return nil
-	}
-
-	items := make([]ColValue, 0, len(arbitrary_json))
-
-	for columnName, v := range arbitrary_json {
-		items = append(items, ColValue{column: columnName, value: v})
-	}
-
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].column < items[j].column
-	})
-
-	columns := make([]string, 0, len(items))
-	for _, v := range items {
-		columns = append(columns, v.column)
-	}
-
-	values := make([]interface{}, 0, len(items))
-	for _, v := range items {
-		values = append(values, v.value)
-	}
-
-	return &ParsedPacket{
-		tableName: tableName,
-		columns:   columns,
-		values:    values,
-	}
-}
-
-type ColumnByTableAndName = map[string]map[string]ColumnInfo
-
-type ColumnInfo struct {
-	Table    string
-	ColType  string
-	Name     string
-	Position uint64
-}
-
-func fetchColumnOrder(dbConn driver.Conn) (ColumnByTableAndName, error) {
+func fetchClickhouseSchema(dbConn driver.Conn) (DbTableColumnMap, error) {
 	fmt.Println("Fetching column info...")
 
 	rows, err := dbConn.Query(context.Background(), `
@@ -324,7 +322,7 @@ SELECT table, position, type, name
 FROM system.columns
 WHERE database = 'default'`)
 
-	result := make(ColumnByTableAndName)
+	result := make(DbTableColumnMap)
 
 	if err != nil {
 		return result, err
@@ -358,7 +356,7 @@ WHERE database = 'default'`)
 	return result, err
 }
 
-func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTableAndName) bool {
+func insertIntoDb(dbConn driver.Conn, rows []*ParsedPacket, columnInfo DbTableColumnMap) bool {
 	columnNames := rows[0].columns
 	tableName := rows[0].tableName
 	columns := columnInfo[tableName]
@@ -417,14 +415,18 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 
 			// fmt.Println("Converting column", colName, "to", colInfo.ColType)
 
-			if colInfo.ColType == "Float32" {
+			switch colInfo.ColType {
+			case "Float32":
 				items := make([]float32, len(rows))
 				for i, row := range rows {
 					val := row.values[colIndex]
 					switch v := val.(type) {
 					case int:
+						items[i] = float32(v)
 					case int64:
+						items[i] = float32(v)
 					case float32:
+						items[i] = v
 					case float64:
 						items[i] = float32(v)
 					case bool:
@@ -451,7 +453,7 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 					fmt.Println("Add column error", tableName, err)
 					return true
 				}
-			} else if colInfo.ColType == "String" {
+			case "String":
 				items := make([]string, len(rows))
 				for i, row := range rows {
 					val := row.values[colIndex]
@@ -474,7 +476,7 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 					fmt.Println("Add column error", tableName, err)
 					return true
 				}
-			} else if colInfo.ColType == "DateTime" || colInfo.ColType == "DateTime64" {
+			case "DateTime", "DateTime64":
 				items := make([]time.Time, len(rows))
 				for i, row := range rows {
 					val := row.values[colIndex]
@@ -500,7 +502,7 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 					fmt.Println("Add column error", tableName, err)
 					return true
 				}
-			} else if colInfo.ColType == "UInt16" {
+			case "UInt16":
 				items := make([]uint16, len(rows))
 				for i, row := range rows {
 					val := row.values[colIndex]
@@ -534,7 +536,7 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 					fmt.Println("Add column error", tableName, err)
 					return true
 				}
-			} else if colInfo.ColType == "UInt32" {
+			case "UInt32":
 				items := make([]uint32, len(rows))
 				for i, row := range rows {
 					val := row.values[colIndex]
@@ -568,7 +570,7 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 					fmt.Println("Add column error", tableName, err)
 					return true
 				}
-			} else if colInfo.ColType == "Int32" {
+			case "Int32":
 				items := make([]int32, len(rows))
 				for i, row := range rows {
 					val := row.values[colIndex]
@@ -602,7 +604,7 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 					fmt.Println("Add column error", tableName, err)
 					return true
 				}
-			} else if colInfo.ColType == "UInt8" {
+			case "UInt8":
 				items := make([]uint8, len(rows))
 				for i, row := range rows {
 					val := row.values[colIndex]
@@ -636,7 +638,7 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 					fmt.Println("Add column error", tableName, err)
 					return true
 				}
-			} else if colInfo.ColType == "UInt64" {
+			case "UInt64":
 				items := make([]uint64, len(rows))
 				for i, row := range rows {
 					val := row.values[colIndex]
@@ -670,7 +672,7 @@ func insertIntoDb(dbConn driver.Conn, rows []ParsedPacket, columnInfo ColumnByTa
 					fmt.Println("Add column error", tableName, err)
 					return true
 				}
-			} else {
+			default:
 				fmt.Println("Unknown column type", tableName, colInfo.ColType)
 				return true
 			}
@@ -757,6 +759,60 @@ func parseOldPacket(x string) *ParsedPacket {
 			}
 		}
 		isColumn = !isColumn
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].column < items[j].column
+	})
+
+	columns := make([]string, 0, len(items))
+	for _, v := range items {
+		columns = append(columns, v.column)
+	}
+
+	values := make([]interface{}, 0, len(items))
+	for _, v := range items {
+		values = append(values, v.value)
+	}
+
+	return &ParsedPacket{
+		tableName: tableName,
+		columns:   columns,
+		values:    values,
+	}
+}
+
+func parsePacket(x []byte) *ParsedPacket {
+	if x[0] != '{' {
+		//fmt.Println("Old log format:", string(x[:150]))
+		return parseOldPacket(string(x))
+	}
+
+	var arbitrary_json map[string]interface{}
+	err := json.Unmarshal([]byte(x), &arbitrary_json)
+
+	if err != nil {
+		fmt.Println("Parse packet error", err)
+		return nil
+	}
+
+	if arbitrary_json == nil {
+		fmt.Println("Parse json returned nil")
+		return nil
+	}
+
+	tableName, tableNameOk := arbitrary_json["_t"].(string)
+	delete(arbitrary_json, "_t")
+
+	if !tableNameOk || tableName == "" {
+		fmt.Println("Table name is empty")
+		return nil
+	}
+
+	items := make([]ColValue, 0, len(arbitrary_json))
+
+	for columnName, v := range arbitrary_json {
+		items = append(items, ColValue{column: columnName, value: v})
 	}
 
 	sort.Slice(items, func(i, j int) bool {
