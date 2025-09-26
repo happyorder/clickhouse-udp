@@ -373,7 +373,7 @@ WHERE database = 'default'`)
 		result[table][name] = ColumnInfo{
 			Table:    table,
 			Position: pos,
-			ColType:  strings.Replace(strings.Replace(strings.Replace(strings.Replace(colType, "(3)", "", 1), ")", "", 1), "LowCardinality(", "", 1), "Nullable(", "", 1),
+			ColType:  normalizeClickHouseType(colType),
 			Name:     name,
 		}
 	}
@@ -381,6 +381,189 @@ WHERE database = 'default'`)
 	fmt.Println("...Fetched columns for", len(result), "tables")
 
 	return result, err
+}
+
+// normalizeClickHouseType removes wrapper types and precision specifiers to get the base type
+func normalizeClickHouseType(colType string) string {
+	// Remove precision specifiers like (3), (9), etc.
+	re := regexp.MustCompile(`\(\d+\)`)
+	normalized := re.ReplaceAllString(colType, "")
+
+	// Remove wrapper types in order of nesting
+	wrapperTypes := []string{
+		"Nullable(",
+		"LowCardinality(",
+	}
+
+	for _, wrapper := range wrapperTypes {
+		if strings.HasPrefix(normalized, wrapper) {
+			// Remove the wrapper prefix and its closing parenthesis
+			normalized = strings.TrimPrefix(normalized, wrapper)
+			if strings.HasSuffix(normalized, ")") {
+				normalized = strings.TrimSuffix(normalized, ")")
+			}
+		}
+	}
+
+	// Special handling for Map types - preserve the full structure
+	if strings.HasPrefix(normalized, "Map(") {
+		return "Map"
+	}
+
+	// Special handling for Array types
+	if strings.HasPrefix(normalized, "Array(") {
+		return "Array"
+	}
+
+	// Remove any remaining parentheses for simple types
+	if strings.Contains(normalized, "(") && !strings.HasPrefix(normalized, "Map(") && !strings.HasPrefix(normalized, "Array(") {
+		normalized = strings.Split(normalized, "(")[0]
+	}
+
+	return normalized
+}
+
+// Seen clickhouse datatypes:
+// UInt8
+// UInt16
+// UInt32
+// UInt64
+// String
+// Nullable(Float32)
+// Nullable(Float64)
+// Map(String, String)
+// Map(String, Float32)
+// Map(String, Float64)
+// Array(UInt8)
+// Array(String)
+// Array(LowCardinality(String))
+// Map(LowCardinality(String), String)
+// Map(LowCardinality(String), Float32)
+// Map(LowCardinality(String), Float64)
+// LowCardinality(String)
+// Int32
+// Int64
+// Float32
+// Float64
+// DateTime
+// DateTime64(3)
+// DateTime64(9)
+
+// Helper functions for type conversion
+func convertToFloat32(val interface{}, tableName, colName string) float32 {
+	switch v := val.(type) {
+	case int:
+		return float32(v)
+	case int64:
+		return float32(v)
+	case float32:
+		return v
+	case float64:
+		return float32(v)
+	case bool:
+		if v {
+			return 1
+		}
+		return 0
+	case string:
+		if parsed, err := strconv.ParseFloat(v, 32); err == nil {
+			return float32(parsed)
+		}
+		fmt.Println("Invalid float32 number", tableName, colName, v)
+		return 0
+	default:
+		fmt.Println("Invalid col conversion to float32", tableName, colName, v)
+		return 0
+	}
+}
+
+func convertToFloat64(val interface{}, tableName, colName string) float64 {
+	switch v := val.(type) {
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case float32:
+		return float64(v)
+	case float64:
+		return v
+	case bool:
+		if v {
+			return 1
+		}
+		return 0
+	case string:
+		if parsed, err := strconv.ParseFloat(v, 64); err == nil {
+			return parsed
+		}
+		fmt.Println("Invalid float64 number", tableName, colName, v)
+		return 0
+	default:
+		fmt.Println("Invalid col conversion to float64", tableName, colName, v)
+		return 0
+	}
+}
+
+func convertToString(val interface{}) string {
+	switch v := val.(type) {
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case float32:
+		return strconv.FormatFloat(float64(v), 'f', 3, 32)
+	case float64:
+		return strconv.FormatFloat(v, 'f', 3, 64)
+	case string:
+		return v
+	case bool:
+		if v {
+			return "true"
+		}
+		return "false"
+	default:
+		return ""
+	}
+}
+
+func convertToTime(val interface{}, tableName, colName string) time.Time {
+	switch v := val.(type) {
+	case int:
+		return time.UnixMilli(int64(v))
+	case int64:
+		return time.UnixMilli(v)
+	case float32:
+		return time.UnixMilli(int64(v))
+	case float64:
+		return time.UnixMilli(int64(v))
+	case string:
+		if date, err := time.Parse(time.RFC3339, strings.Replace(v, " ", "T", 1)+"Z"); err == nil {
+			return date
+		}
+		fmt.Println("Invalid date", tableName, colName, v)
+		return time.Time{}
+	default:
+		fmt.Println("Invalid col conversion to time", tableName, colName, v)
+		return time.Time{}
+	}
+}
+
+func convertToMap(val interface{}, tableName, colName string) map[string]interface{} {
+	switch v := val.(type) {
+	case map[string]interface{}:
+		return v
+	case string:
+		// Try to parse JSON string
+		var result map[string]interface{}
+		if err := json.Unmarshal([]byte(v), &result); err == nil {
+			return result
+		}
+		fmt.Println("Invalid map conversion from string", tableName, colName, v)
+		return make(map[string]interface{})
+	default:
+		fmt.Println("Invalid col conversion to map", tableName, colName, v)
+		return make(map[string]interface{})
+	}
 }
 
 func insertIntoDb(dbConn driver.Conn, rows []*ParsedPacket, columnInfo DbTableColumnMap) bool {
@@ -394,7 +577,7 @@ func insertIntoDb(dbConn driver.Conn, rows []*ParsedPacket, columnInfo DbTableCo
 	}
 
 	if len(columns) != len(columnNames) {
-		fmt.Println("Column missmatch in", tableName)
+		fmt.Println("Column mismatch in", tableName)
 
 		columnNameMap := make(map[string]bool)
 		for _, v := range columnNames {
@@ -413,10 +596,7 @@ func insertIntoDb(dbConn driver.Conn, rows []*ParsedPacket, columnInfo DbTableCo
 		return false
 	}
 
-	// fmt.Println("Inserting", len(rows), "rows into", tableName, "...")
-
 	tx, err := dbConn.PrepareBatch(context.Background(), fmt.Sprintf("INSERT INTO %s", tableName))
-
 	if err != nil {
 		fmt.Println("Could not start transaction", err)
 		return true
@@ -431,294 +611,300 @@ func insertIntoDb(dbConn driver.Conn, rows []*ParsedPacket, columnInfo DbTableCo
 
 	for colIndex, colName := range columnNames {
 		colInfo, ok := columns[colName]
-
-		if ok {
-			col := tx.Column(int(colInfo.Position) - 1)
-
-			if col == nil {
-				fmt.Println("Col is nil", tableName, colName)
-				return true
-			}
-
-			// fmt.Println("Converting column", colName, "to", colInfo.ColType)
-
-			switch colInfo.ColType {
-			case "Float32":
-				items := make([]float32, len(rows))
-				for i, row := range rows {
-					val := row.values[colIndex]
-					switch v := val.(type) {
-					case int:
-						items[i] = float32(v)
-					case int64:
-						items[i] = float32(v)
-					case float32:
-						items[i] = v
-					case float64:
-						items[i] = float32(v)
-					case bool:
-						if v {
-							items[i] = 1
-						} else {
-							items[i] = 0
-						}
-					case string:
-						v2, err := strconv.ParseFloat(v, 32)
-						if err == nil {
-							items[i] = float32(v2)
-						} else {
-							items[i] = 0
-							fmt.Println("Invalid float number", tableName, colName, v)
-						}
-					default:
-						items[i] = 0
-						fmt.Println("Invalid col conversion", tableName, colName, v)
-					}
-				}
-				err = col.Append(items)
-				if err != nil {
-					fmt.Println("Add column error", tableName, err)
-					return true
-				}
-			case "String":
-				items := make([]string, len(rows))
-				for i, row := range rows {
-					val := row.values[colIndex]
-					switch v := val.(type) {
-					case int:
-					case int64:
-						items[i] = strconv.FormatInt(int64(v), 10)
-					case float32:
-					case float64:
-						items[i] = strconv.FormatFloat(float64(v), 'f', 3, 64)
-					case string:
-						items[i] = v
-					default:
-						items[i] = ""
-						fmt.Println("Invalid col conversion", tableName, colName, v)
-					}
-				}
-				err = col.Append(items)
-				if err != nil {
-					fmt.Println("Add column error", tableName, err)
-					return true
-				}
-			case "DateTime", "DateTime64":
-				items := make([]time.Time, len(rows))
-				for i, row := range rows {
-					val := row.values[colIndex]
-					switch v := val.(type) {
-					case int:
-					case int64:
-						items[i] = time.UnixMilli(int64(v))
-					case float32:
-					case float64:
-						items[i] = time.UnixMilli(int64(v))
-					case string:
-						date, err := time.Parse(time.RFC3339, strings.Replace(v, " ", "T", 1)+"Z")
-						if err != nil {
-							fmt.Println("Invalid date", tableName, colName, v, err)
-						}
-						items[i] = date
-					default:
-						fmt.Println("Invalid col conversion", tableName, colName, v)
-					}
-				}
-				err = col.Append(items)
-				if err != nil {
-					fmt.Println("Add column error", tableName, err)
-					return true
-				}
-			case "UInt16":
-				items := make([]uint16, len(rows))
-				for i, row := range rows {
-					val := row.values[colIndex]
-					switch v := val.(type) {
-					case int:
-					case int64:
-					case float32:
-					case float64:
-						items[i] = uint16(v)
-					case bool:
-						if v {
-							items[i] = 1
-						} else {
-							items[i] = 0
-						}
-					case string:
-						v2, err := strconv.ParseUint(v, 10, 16)
-						if err == nil {
-							items[i] = uint16(v2)
-						} else {
-							items[i] = 0
-							fmt.Println("Invalid uint16 number", tableName, colName, v)
-						}
-					default:
-						items[i] = 0
-						fmt.Println("Invalid col conversion", tableName, colName, v)
-					}
-				}
-				err = col.Append(items)
-				if err != nil {
-					fmt.Println("Add column error", tableName, err)
-					return true
-				}
-			case "UInt32":
-				items := make([]uint32, len(rows))
-				for i, row := range rows {
-					val := row.values[colIndex]
-					switch v := val.(type) {
-					case int:
-					case int64:
-					case float32:
-					case float64:
-						items[i] = uint32(v)
-					case bool:
-						if v {
-							items[i] = 1
-						} else {
-							items[i] = 0
-						}
-					case string:
-						v2, err := strconv.ParseUint(v, 10, 32)
-						if err == nil {
-							items[i] = uint32(v2)
-						} else {
-							items[i] = 0
-							fmt.Println("Invalid uint32 number", tableName, colName, v)
-						}
-					default:
-						items[i] = 0
-						fmt.Println("Invalid col conversion", tableName, colName, v)
-					}
-				}
-				err = col.Append(items)
-				if err != nil {
-					fmt.Println("Add column error", tableName, err)
-					return true
-				}
-			case "Int32":
-				items := make([]int32, len(rows))
-				for i, row := range rows {
-					val := row.values[colIndex]
-					switch v := val.(type) {
-					case int:
-					case int64:
-					case float32:
-					case float64:
-						items[i] = int32(v)
-					case bool:
-						if v {
-							items[i] = 1
-						} else {
-							items[i] = 0
-						}
-					case string:
-						v2, err := strconv.ParseInt(v, 10, 32)
-						if err == nil {
-							items[i] = int32(v2)
-						} else {
-							items[i] = 0
-							fmt.Println("Invalid int32 number", tableName, colName, v)
-						}
-					default:
-						items[i] = 0
-						fmt.Println("Invalid col conversion", tableName, colName, v)
-					}
-				}
-				err = col.Append(items)
-				if err != nil {
-					fmt.Println("Add column error", tableName, err)
-					return true
-				}
-			case "UInt8":
-				items := make([]uint8, len(rows))
-				for i, row := range rows {
-					val := row.values[colIndex]
-					switch v := val.(type) {
-					case int:
-					case int64:
-					case float32:
-					case float64:
-						items[i] = uint8(v)
-					case bool:
-						if v {
-							items[i] = 1
-						} else {
-							items[i] = 0
-						}
-					case string:
-						v2, err := strconv.ParseUint(v, 10, 8)
-						if err == nil {
-							items[i] = uint8(v2)
-						} else {
-							items[i] = 0
-							fmt.Println("Invalid uint8 number", tableName, colName, v)
-						}
-					default:
-						items[i] = 0
-						fmt.Println("Invalid col conversion", tableName, colName, v)
-					}
-				}
-				err = col.Append(items)
-				if err != nil {
-					fmt.Println("Add column error", tableName, err)
-					return true
-				}
-			case "UInt64":
-				items := make([]uint64, len(rows))
-				for i, row := range rows {
-					val := row.values[colIndex]
-					switch v := val.(type) {
-					case int:
-					case int64:
-					case float32:
-					case float64:
-						items[i] = uint64(v)
-					case bool:
-						if v {
-							items[i] = 1
-						} else {
-							items[i] = 0
-						}
-					case string:
-						v2, err := strconv.ParseUint(v, 10, 64)
-						if err == nil {
-							items[i] = uint64(v2)
-						} else {
-							items[i] = 0
-							fmt.Println("Invalid uint64 number", tableName, colName, v)
-						}
-					default:
-						items[i] = 0
-						fmt.Println("Invalid col conversion", tableName, colName, v)
-					}
-				}
-				err = col.Append(items)
-				if err != nil {
-					fmt.Println("Add column error", tableName, err)
-					return true
-				}
-			default:
-				fmt.Println("Unknown column type", tableName, colInfo.ColType)
-				return true
-			}
-		} else {
+		if !ok {
 			fmt.Println("Column does not exist in db table", tableName, colName)
+			continue
+		}
+
+		col := tx.Column(int(colInfo.Position) - 1)
+		if col == nil {
+			fmt.Println("Col is nil", tableName, colName)
+			return true
+		}
+
+		if err := appendColumnData(col, colInfo.ColType, rows, colIndex, tableName, colName); err != nil {
+			fmt.Println("Add column error", tableName, colName, err)
+			return true
 		}
 	}
 
-	// fmt.Println("Sending...")
-
-	err = tx.Send()
-
-	if err != nil {
+	if err := tx.Send(); err != nil {
 		fmt.Println("Commit error", tableName, err)
 		return true
 	}
 
 	fmt.Println("Saved", len(rows), "rows to", tableName)
 	return false
+}
+
+func appendColumnData(col driver.BatchColumn, colType string, rows []*ParsedPacket, colIndex int, tableName, colName string) error {
+	switch colType {
+	case "Float32":
+		items := make([]float32, len(rows))
+		for i, row := range rows {
+			items[i] = convertToFloat32(row.values[colIndex], tableName, colName)
+		}
+		return col.Append(items)
+
+	case "Float64":
+		items := make([]float64, len(rows))
+		for i, row := range rows {
+			items[i] = convertToFloat64(row.values[colIndex], tableName, colName)
+		}
+		return col.Append(items)
+
+	case "String":
+		items := make([]string, len(rows))
+		for i, row := range rows {
+			items[i] = convertToString(row.values[colIndex])
+		}
+		return col.Append(items)
+
+	case "DateTime", "DateTime64":
+		items := make([]time.Time, len(rows))
+		for i, row := range rows {
+			items[i] = convertToTime(row.values[colIndex], tableName, colName)
+		}
+		return col.Append(items)
+
+	case "Int32":
+		items := make([]int32, len(rows))
+		for i, row := range rows {
+			val := row.values[colIndex]
+			switch v := val.(type) {
+			case int:
+				items[i] = int32(v)
+			case int64:
+				items[i] = int32(v)
+			case float32:
+				items[i] = int32(v)
+			case float64:
+				items[i] = int32(v)
+			case bool:
+				if v {
+					items[i] = 1
+				} else {
+					items[i] = 0
+				}
+			case string:
+				if parsed, err := strconv.ParseInt(v, 10, 32); err == nil {
+					items[i] = int32(parsed)
+				} else {
+					fmt.Println("Invalid int32 number", tableName, colName, v)
+					items[i] = 0
+				}
+			default:
+				fmt.Println("Invalid col conversion to int32", tableName, colName, v)
+				items[i] = 0
+			}
+		}
+		return col.Append(items)
+
+	case "Int64":
+		items := make([]int64, len(rows))
+		for i, row := range rows {
+			val := row.values[colIndex]
+			switch v := val.(type) {
+			case int:
+				items[i] = int64(v)
+			case int64:
+				items[i] = v
+			case float32:
+				items[i] = int64(v)
+			case float64:
+				items[i] = int64(v)
+			case bool:
+				if v {
+					items[i] = 1
+				} else {
+					items[i] = 0
+				}
+			case string:
+				if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
+					items[i] = parsed
+				} else {
+					fmt.Println("Invalid int64 number", tableName, colName, v)
+					items[i] = 0
+				}
+			default:
+				fmt.Println("Invalid col conversion to int64", tableName, colName, v)
+				items[i] = 0
+			}
+		}
+		return col.Append(items)
+
+	case "UInt8":
+		items := make([]uint8, len(rows))
+		for i, row := range rows {
+			val := row.values[colIndex]
+			switch v := val.(type) {
+			case int:
+				items[i] = uint8(v)
+			case int64:
+				items[i] = uint8(v)
+			case float32:
+				items[i] = uint8(v)
+			case float64:
+				items[i] = uint8(v)
+			case bool:
+				if v {
+					items[i] = 1
+				} else {
+					items[i] = 0
+				}
+			case string:
+				if parsed, err := strconv.ParseUint(v, 10, 8); err == nil {
+					items[i] = uint8(parsed)
+				} else {
+					fmt.Println("Invalid uint8 number", tableName, colName, v)
+					items[i] = 0
+				}
+			default:
+				fmt.Println("Invalid col conversion to uint8", tableName, colName, v)
+				items[i] = 0
+			}
+		}
+		return col.Append(items)
+
+	case "UInt16":
+		items := make([]uint16, len(rows))
+		for i, row := range rows {
+			val := row.values[colIndex]
+			switch v := val.(type) {
+			case int:
+				items[i] = uint16(v)
+			case int64:
+				items[i] = uint16(v)
+			case float32:
+				items[i] = uint16(v)
+			case float64:
+				items[i] = uint16(v)
+			case bool:
+				if v {
+					items[i] = 1
+				} else {
+					items[i] = 0
+				}
+			case string:
+				if parsed, err := strconv.ParseUint(v, 10, 16); err == nil {
+					items[i] = uint16(parsed)
+				} else {
+					fmt.Println("Invalid uint16 number", tableName, colName, v)
+					items[i] = 0
+				}
+			default:
+				fmt.Println("Invalid col conversion to uint16", tableName, colName, v)
+				items[i] = 0
+			}
+		}
+		return col.Append(items)
+
+	case "UInt32":
+		items := make([]uint32, len(rows))
+		for i, row := range rows {
+			val := row.values[colIndex]
+			switch v := val.(type) {
+			case int:
+				items[i] = uint32(v)
+			case int64:
+				items[i] = uint32(v)
+			case float32:
+				items[i] = uint32(v)
+			case float64:
+				items[i] = uint32(v)
+			case bool:
+				if v {
+					items[i] = 1
+				} else {
+					items[i] = 0
+				}
+			case string:
+				if parsed, err := strconv.ParseUint(v, 10, 32); err == nil {
+					items[i] = uint32(parsed)
+				} else {
+					fmt.Println("Invalid uint32 number", tableName, colName, v)
+					items[i] = 0
+				}
+			default:
+				fmt.Println("Invalid col conversion to uint32", tableName, colName, v)
+				items[i] = 0
+			}
+		}
+		return col.Append(items)
+
+	case "UInt64":
+		items := make([]uint64, len(rows))
+		for i, row := range rows {
+			val := row.values[colIndex]
+			switch v := val.(type) {
+			case int:
+				items[i] = uint64(v)
+			case int64:
+				items[i] = uint64(v)
+			case float32:
+				items[i] = uint64(v)
+			case float64:
+				items[i] = uint64(v)
+			case bool:
+				if v {
+					items[i] = 1
+				} else {
+					items[i] = 0
+				}
+			case string:
+				if parsed, err := strconv.ParseUint(v, 10, 64); err == nil {
+					items[i] = parsed
+				} else {
+					fmt.Println("Invalid uint64 number", tableName, colName, v)
+					items[i] = 0
+				}
+			default:
+				fmt.Println("Invalid col conversion to uint64", tableName, colName, v)
+				items[i] = 0
+			}
+		}
+		return col.Append(items)
+
+	case "Map":
+		items := make([]map[string]interface{}, len(rows))
+		for i, row := range rows {
+			items[i] = convertToMap(row.values[colIndex], tableName, colName)
+		}
+		return col.Append(items)
+
+	case "Array":
+		// Handle arrays as generic interface{} slices for flexibility
+		items := make([][]interface{}, len(rows))
+		for i, row := range rows {
+			val := row.values[colIndex]
+			switch v := val.(type) {
+			case []interface{}:
+				items[i] = v
+			case string:
+				// Try to parse JSON array string
+				var arr []interface{}
+				if err := json.Unmarshal([]byte(v), &arr); err == nil {
+					items[i] = arr
+				} else {
+					fmt.Println("Invalid array conversion from string", tableName, colName, v)
+					items[i] = []interface{}{}
+				}
+			default:
+				fmt.Println("Invalid col conversion to array", tableName, colName, v)
+				items[i] = []interface{}{}
+			}
+		}
+		return col.Append(items)
+
+	default:
+		// For any other unknown types, try to convert to string as fallback
+		fmt.Printf("Warning: Unknown column type %s for %s.%s, falling back to string conversion\n", colType, tableName, colName)
+		items := make([]string, len(rows))
+		for i, row := range rows {
+			items[i] = convertToString(row.values[colIndex])
+		}
+		return col.Append(items)
+	}
 }
 
 func SplitWithEscaping(s, separator, escape string) []string {
