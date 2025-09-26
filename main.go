@@ -87,7 +87,6 @@ func main() {
 		Schema: &schema,
 	}
 	queuedUnparsed := make(chan *ParsedPacket, 5000)
-	wg := &sync.WaitGroup{}
 
 	go func() {
 		startUdpServer(exitCtx, queuedUnparsed)
@@ -97,16 +96,15 @@ func main() {
 		startTcpServer(exitCtx, queuedUnparsed)
 	}()
 
+	go func() {
+		updateDbSchemaThread(exitCtx, dbConn, currentSchema)
+	}()
+
+	wg := &sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		createLogsSaveThread(exitCtx, dbConn, currentSchema, queuedUnparsed, 30*time.Second, 2000)
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		updateDbSchemaThread(exitCtx, dbConn, currentSchema)
 	}()
 
 	wg.Wait()
@@ -114,13 +112,13 @@ func main() {
 
 func updateDbSchemaThread(exitCtx context.Context, dbConn driver.Conn, currentSchema CurrentDbSchema) {
 	for {
-		time.Sleep(time.Minute * 10)
+		expire := time.After(time.Minute * 10)
 
 		select {
 		case <-exitCtx.Done():
 			return
 
-		default:
+		case <-expire:
 			schema, err := fetchClickhouseSchema(dbConn)
 			if err != nil {
 				if exception, ok := err.(*clickhouse.Exception); ok {
@@ -146,6 +144,7 @@ func createLogsSaveThread(interruptCtx context.Context, clickh clickhouse.Conn, 
 			select {
 			case value, ok := <-values:
 				if !ok {
+					isExiting = true
 					goto sendBatch
 				}
 				tableKey := value.PacketKey()
@@ -179,7 +178,7 @@ func createLogsSaveThread(interruptCtx context.Context, clickh clickhouse.Conn, 
 			for i := 0; i < 5; i++ {
 				shouldRetry := insertIntoDb(clickh, rows, *schema.Schema)
 				if !shouldRetry {
-					return
+					break
 				}
 				fmt.Println("Retrying insert in 5 seconds")
 				time.Sleep(time.Second * 5)
@@ -206,19 +205,38 @@ func startUdpServer(exitCtx context.Context, packetQueue chan<- *ParsedPacket) {
 
 	log.Println("Listening for UDP on", conn.LocalAddr())
 
+	go func() {
+		<-exitCtx.Done()
+		conn.Close()
+	}()
+
 	var buf [1024 * 8]byte
 	for {
+		select {
+		case <-exitCtx.Done():
+			return
+		default:
+		}
+
 		rlen, _, err := conn.ReadFromUDP(buf[:])
 
 		if err != nil {
-			fmt.Println("read error", err)
-			continue
+			select {
+			case <-exitCtx.Done():
+				return
+			default:
+				fmt.Println("read error", err)
+				continue
+			}
 		}
 
-		// log.Println("Received", rlen, "bytes from", remote, "error:", err)
-
 		parsed := parsePacket(buf[:rlen])
-		packetQueue <- parsed
+
+		select {
+		case packetQueue <- parsed:
+		case <-exitCtx.Done():
+			return
+		}
 	}
 }
 
@@ -227,20 +245,35 @@ func startTcpServer(exitCtx context.Context, packetQueue chan<- *ParsedPacket) {
 		Port: 9030,
 		IP:   net.ParseIP("0.0.0.0"),
 	}
-	conn, err := net.ListenTCP("tcp", &addr)
+	listener, err := net.ListenTCP("tcp", &addr)
 	if err != nil {
 		panic(err)
 	}
-	defer conn.Close()
+	defer listener.Close()
 
-	log.Println("Listening for TCP on", conn.Addr().String())
+	log.Println("Listening for TCP on", listener.Addr().String())
+
+	go func() {
+		<-exitCtx.Done()
+		listener.Close()
+	}()
 
 	for {
-		// Listen for an incoming connection.
-		conn, err := conn.Accept()
+		select {
+		case <-exitCtx.Done():
+			return
+		default:
+		}
+
+		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Println("Error accepting")
-			panic(err)
+			select {
+			case <-exitCtx.Done():
+				return
+			default:
+				fmt.Println("Error accepting:", err)
+				continue
+			}
 		}
 
 		fmt.Println("New tcp client")
