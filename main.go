@@ -230,13 +230,7 @@ func startUdpServer(exitCtx context.Context, packetQueue chan<- *ParsedPacket) {
 			}
 		}
 
-		parsed := parsePacket(buf[:rlen])
-
-		select {
-		case packetQueue <- parsed:
-		case <-exitCtx.Done():
-			return
-		}
+		packetQueue <- parsePacket(buf[:rlen])
 	}
 }
 
