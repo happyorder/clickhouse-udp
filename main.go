@@ -96,7 +96,7 @@ func main() {
 	}()
 
 	go func() {
-		updateDbSchemaThread(exitCtx, dbConn, currentSchema)
+		updateDbSchemaThread(exitCtx, dbConn, &currentSchema)
 	}()
 
 	go func() {
@@ -108,13 +108,13 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		createLogsSaveThread(exitCtx, dbConn, currentSchema, queuedUnparsed, 30*time.Second, 2000)
+		createLogsSaveThread(exitCtx, dbConn, &currentSchema, queuedUnparsed, 30*time.Second, 2000)
 	}()
 
 	wg.Wait()
 }
 
-func updateDbSchemaThread(exitCtx context.Context, dbConn driver.Conn, currentSchema CurrentDbSchema) {
+func updateDbSchemaThread(exitCtx context.Context, dbConn driver.Conn, currentSchema *CurrentDbSchema) {
 	for {
 		expire := time.After(time.Minute * 10)
 
@@ -142,7 +142,7 @@ type QueuedPacketList struct {
 	OldestPacketTime time.Time
 }
 
-func createLogsSaveThread(interruptCtx context.Context, clickh clickhouse.Conn, schema CurrentDbSchema, values <-chan *ParsedPacket, maxTimeout time.Duration, maxItems int) {
+func createLogsSaveThread(interruptCtx context.Context, clickh clickhouse.Conn, schema *CurrentDbSchema, values <-chan *ParsedPacket, maxTimeout time.Duration, maxItems int) {
 	isExiting := false
 	var queueByTable = make(map[string]*QueuedPacketList)
 
