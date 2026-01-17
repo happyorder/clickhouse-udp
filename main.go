@@ -463,10 +463,6 @@ func insertIntoDb(dbConn driver.Conn, rows []*ParsedPacket, columnInfo DbTableCo
 		return true
 	}
 
-	if tableName == "otel_traces" {
-		fmt.Println("Saving otel trace", rows)
-	}
-
 	defer tx.Abort()
 
 	for _, dbCol := range dbColumns {
