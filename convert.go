@@ -8,305 +8,159 @@ import (
 	"time"
 )
 
-func convertToInt8(val interface{}, tableName string, colName string) int8 {
+func toInt64(val interface{}) (int64, bool) {
 	switch v := val.(type) {
 	case int:
-		return int8(v)
+		return int64(v), true
 	case int64:
-		return int8(v)
+		return v, true
 	case float32:
-		return int8(v)
+		return int64(v), true
 	case float64:
-		return int8(v)
+		return int64(v), true
 	case bool:
 		if v {
-			return 1
-		} else {
-			return 0
+			return 1, true
 		}
-	case string:
-		if parsed, err := strconv.ParseInt(v, 10, 8); err == nil {
-			return int8(parsed)
-		} else {
-			fmt.Println("Invalid int8 number", tableName, colName, v)
-			return 0
-		}
-	default:
-		fmt.Println("Invalid col conversion to int8", tableName, colName, v)
-		return 0
-	}
-}
-
-func convertToInt16(val interface{}, tableName string, colName string) int16 {
-	switch v := val.(type) {
-	case int:
-		return int16(v)
-	case int64:
-		return int16(v)
-	case float32:
-		return int16(v)
-	case float64:
-		return int16(v)
-	case bool:
-		if v {
-			return 1
-		} else {
-			return 0
-		}
-	case string:
-		if parsed, err := strconv.ParseInt(v, 10, 16); err == nil {
-			return int16(parsed)
-		} else {
-			fmt.Println("Invalid int16 number", tableName, colName, v)
-			return 0
-		}
-	default:
-		fmt.Println("Invalid col conversion to int16", tableName, colName, v)
-		return 0
-	}
-}
-
-func convertToInt32(val interface{}, tableName string, colName string) int32 {
-	switch v := val.(type) {
-	case int:
-		return int32(v)
-	case int64:
-		return int32(v)
-	case float32:
-		return int32(v)
-	case float64:
-		return int32(v)
-	case bool:
-		if v {
-			return 1
-		} else {
-			return 0
-		}
-	case string:
-		if parsed, err := strconv.ParseInt(v, 10, 32); err == nil {
-			return int32(parsed)
-		} else {
-			fmt.Println("Invalid int32 number", tableName, colName, v)
-			return 0
-		}
-	default:
-		fmt.Println("Invalid col conversion to int32", tableName, colName, v)
-		return 0
-	}
-}
-
-func convertToInt64(val interface{}, tableName string, colName string) int64 {
-	switch v := val.(type) {
-	case int:
-		return int64(v)
-	case int64:
-		return v
-	case float32:
-		return int64(v)
-	case float64:
-		return int64(v)
-	case bool:
-		if v {
-			return 1
-		} else {
-			return 0
-		}
+		return 0, true
 	case string:
 		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
-			return parsed
-		} else {
-			fmt.Println("Invalid int64 number", tableName, colName, v)
-			return 0
+			return parsed, true
 		}
-	default:
-		fmt.Println("Invalid col conversion to int64", tableName, colName, v)
-		return 0
 	}
+	return 0, false
+}
+
+func toUint64(val interface{}) (uint64, bool) {
+	switch v := val.(type) {
+	case int:
+		return uint64(v), true
+	case int64:
+		return uint64(v), true
+	case float32:
+		return uint64(v), true
+	case float64:
+		return uint64(v), true
+	case bool:
+		if v {
+			return 1, true
+		}
+		return 0, true
+	case string:
+		if parsed, err := strconv.ParseUint(v, 10, 64); err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+func toFloat64(val interface{}) (float64, bool) {
+	switch v := val.(type) {
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case float32:
+		return float64(v), true
+	case float64:
+		return v, true
+	case bool:
+		if v {
+			return 1, true
+		}
+		return 0, true
+	case string:
+		if parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+func convertToInt8(val interface{}, tableName, colName string) int8 {
+	if v, ok := toInt64(val); ok {
+		return int8(v)
+	}
+	fmt.Println("Invalid int8", tableName, colName, val)
+	return 0
+}
+
+func convertToInt16(val interface{}, tableName, colName string) int16 {
+	if v, ok := toInt64(val); ok {
+		return int16(v)
+	}
+	fmt.Println("Invalid int16", tableName, colName, val)
+	return 0
+}
+
+func convertToInt32(val interface{}, tableName, colName string) int32 {
+	if v, ok := toInt64(val); ok {
+		return int32(v)
+	}
+	fmt.Println("Invalid int32", tableName, colName, val)
+	return 0
+}
+
+func convertToInt64(val interface{}, tableName, colName string) int64 {
+	if v, ok := toInt64(val); ok {
+		return v
+	}
+	fmt.Println("Invalid int64", tableName, colName, val)
+	return 0
 }
 
 func convertToUInt8(val interface{}, tableName, colName string) uint8 {
-	switch v := val.(type) {
-	case int:
+	if v, ok := toUint64(val); ok {
 		return uint8(v)
-	case int64:
-		return uint8(v)
-	case float32:
-		return uint8(v)
-	case float64:
-		return uint8(v)
-	case bool:
-		if v {
-			return 1
-		}
-		return 0
-	case string:
-		if parsed, err := strconv.ParseUint(v, 10, 8); err == nil {
-			return uint8(parsed)
-		}
-		fmt.Println("Invalid uint8 number", tableName, colName, v)
-		return 0
-	default:
-		fmt.Println("Invalid col conversion to uint8", tableName, colName, v)
-		return 0
 	}
+	fmt.Println("Invalid uint8", tableName, colName, val)
+	return 0
 }
 
 func convertToUInt16(val interface{}, tableName, colName string) uint16 {
-	switch v := val.(type) {
-	case int:
+	if v, ok := toUint64(val); ok {
 		return uint16(v)
-	case int64:
-		return uint16(v)
-	case float32:
-		return uint16(v)
-	case float64:
-		return uint16(v)
-	case bool:
-		if v {
-			return 1
-		}
-		return 0
-	case string:
-		if parsed, err := strconv.ParseUint(v, 10, 16); err == nil {
-			return uint16(parsed)
-		}
-		fmt.Println("Invalid uint16 number", tableName, colName, v)
-		return 0
-	default:
-		fmt.Println("Invalid col conversion to uint16", tableName, colName, v)
-		return 0
 	}
+	fmt.Println("Invalid uint16", tableName, colName, val)
+	return 0
 }
 
 func convertToUInt32(val interface{}, tableName, colName string) uint32 {
-	switch v := val.(type) {
-	case int:
+	if v, ok := toUint64(val); ok {
 		return uint32(v)
-	case int64:
-		return uint32(v)
-	case float32:
-		return uint32(v)
-	case float64:
-		return uint32(v)
-	case bool:
-		if v {
-			return 1
-		}
-		return 0
-	case string:
-		if parsed, err := strconv.ParseUint(v, 10, 32); err == nil {
-			return uint32(parsed)
-		}
-		fmt.Println("Invalid uint32 number", tableName, colName, v)
-		return 0
-	default:
-		fmt.Println("Invalid col conversion to uint32", tableName, colName, v)
-		return 0
 	}
+	fmt.Println("Invalid uint32", tableName, colName, val)
+	return 0
 }
 
 func convertToUInt64(val interface{}, tableName, colName string) uint64 {
-	switch v := val.(type) {
-	case int:
-		return uint64(v)
-	case int64:
-		return uint64(v)
-	case float32:
-		return uint64(v)
-	case float64:
-		return uint64(v)
-	case bool:
-		if v {
-			return 1
-		}
-		return 0
-	case string:
-		if parsed, err := strconv.ParseUint(v, 10, 64); err == nil {
-			return parsed
-		}
-		fmt.Println("Invalid uint64 number", tableName, colName, v)
-		return 0
-	default:
-		fmt.Println("Invalid col conversion to uint64", tableName, colName, v)
-		return 0
-	}
-}
-
-func convertToArray(val interface{}, tableName, colName string) []interface{} {
-	switch v := val.(type) {
-	case []interface{}:
+	if v, ok := toUint64(val); ok {
 		return v
-	case string:
-		// Try to parse JSON array string
-		var arr []interface{}
-		if err := json.Unmarshal([]byte(v), &arr); err == nil {
-			return arr
-		}
-		fmt.Println("Invalid array conversion from string", tableName, colName, v)
-		return []interface{}{}
-	default:
-		fmt.Println("Invalid col conversion to array", tableName, colName, v)
-		return []interface{}{}
 	}
+	fmt.Println("Invalid uint64", tableName, colName, val)
+	return 0
 }
 
-// Helper functions for type conversion
 func convertToFloat32(val interface{}, tableName, colName string) float32 {
-	switch v := val.(type) {
-	case int:
+	if v, ok := toFloat64(val); ok {
 		return float32(v)
-	case int64:
-		return float32(v)
-	case float32:
-		return v
-	case float64:
-		return float32(v)
-	case bool:
-		if v {
-			return 1
-		}
-		return 0
-	case string:
-		if parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
-			return float32(parsed)
-		}
-		fmt.Println("Invalid float32 number", tableName, colName, "'"+v+"'")
-		return 0
-	default:
-		fmt.Println("Invalid col conversion to float32", tableName, colName, v)
-		return 0
 	}
+	fmt.Println("Invalid float32", tableName, colName, val)
+	return 0
 }
 
 func convertToFloat64(val interface{}, tableName, colName string) float64 {
-	switch v := val.(type) {
-	case int:
-		return float64(v)
-	case int64:
-		return float64(v)
-	case float32:
-		return float64(v)
-	case float64:
+	if v, ok := toFloat64(val); ok {
 		return v
-	case bool:
-		if v {
-			return 1
-		}
-		return 0
-	case string:
-		if parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
-			return parsed
-		}
-		fmt.Println("Invalid float64 number", tableName, colName, v)
-		return 0
-	default:
-		fmt.Println("Invalid col conversion to float64", tableName, colName, v)
-		return 0
 	}
+	fmt.Println("Invalid float64", tableName, colName, val)
+	return 0
 }
 
 func convertToString(val interface{}) string {
 	switch v := val.(type) {
+	case string:
+		return v
 	case int:
 		return strconv.Itoa(v)
 	case int64:
@@ -315,8 +169,6 @@ func convertToString(val interface{}) string {
 		return strconv.FormatFloat(float64(v), 'f', 3, 32)
 	case float64:
 		return strconv.FormatFloat(v, 'f', 3, 64)
-	case string:
-		return v
 	case bool:
 		if v {
 			return "true"
@@ -342,93 +194,102 @@ func convertToTime(val interface{}, tableName, colName string) time.Time {
 			return date
 		}
 		fmt.Println("Invalid date", tableName, colName, v)
-		return time.Time{}
 	default:
-		fmt.Println("Invalid col conversion to time", tableName, colName, v)
-		return time.Time{}
+		fmt.Println("Invalid time", tableName, colName, val)
 	}
+	return time.Time{}
+}
+
+func convertToArray(val interface{}, tableName, colName string) []interface{} {
+	switch v := val.(type) {
+	case []interface{}:
+		return v
+	case string:
+		var arr []interface{}
+		if err := json.Unmarshal([]byte(v), &arr); err == nil {
+			return arr
+		}
+		fmt.Println("Invalid array", tableName, colName, v)
+	default:
+		fmt.Println("Invalid array", tableName, colName, val)
+	}
+	return []interface{}{}
 }
 
 func convertToStringMap(val interface{}, tableName, colName string) map[string]string {
 	switch v := val.(type) {
+	case map[string]string:
+		return v
 	case map[string]interface{}:
-		result := make(map[string]string)
+		result := make(map[string]string, len(v))
 		for k, val := range v {
 			result[k] = convertToString(val)
 		}
 		return result
-	case map[string]string:
-		return v
 	case string:
-		// Try to parse JSON string
-		var result map[string]interface{}
-		if err := json.Unmarshal([]byte(v), &result); err == nil {
-			stringMap := make(map[string]string)
-			for k, val := range result {
-				stringMap[k] = convertToString(val)
+		var m map[string]interface{}
+		if err := json.Unmarshal([]byte(v), &m); err == nil {
+			result := make(map[string]string, len(m))
+			for k, val := range m {
+				result[k] = convertToString(val)
 			}
-			return stringMap
+			return result
 		}
-		fmt.Println("Invalid map conversion from string", tableName, colName, v)
-		return make(map[string]string)
+		fmt.Println("Invalid string map", tableName, colName, v)
 	default:
-		fmt.Println("Invalid col conversion to string map", tableName, colName, v)
-		return make(map[string]string)
+		fmt.Println("Invalid string map", tableName, colName, val)
 	}
+	return make(map[string]string)
 }
 
 func convertToFloat32Map(val interface{}, tableName, colName string) map[string]float32 {
 	switch v := val.(type) {
+	case map[string]float32:
+		return v
 	case map[string]interface{}:
-		result := make(map[string]float32)
+		result := make(map[string]float32, len(v))
 		for k, val := range v {
 			result[k] = convertToFloat32(val, tableName, colName)
 		}
 		return result
-	case map[string]float32:
-		return v
 	case string:
-		// Try to parse JSON string
-		var result map[string]interface{}
-		if err := json.Unmarshal([]byte(v), &result); err == nil {
-			float32Map := make(map[string]float32)
-			for k, val := range result {
-				float32Map[k] = convertToFloat32(val, tableName, colName)
+		var m map[string]interface{}
+		if err := json.Unmarshal([]byte(v), &m); err == nil {
+			result := make(map[string]float32, len(m))
+			for k, val := range m {
+				result[k] = convertToFloat32(val, tableName, colName)
 			}
-			return float32Map
+			return result
 		}
-		fmt.Println("Invalid map conversion from string", tableName, colName, v)
-		return make(map[string]float32)
+		fmt.Println("Invalid float32 map", tableName, colName, v)
 	default:
-		fmt.Println("Invalid col conversion to float32 map", tableName, colName, v)
-		return make(map[string]float32)
+		fmt.Println("Invalid float32 map", tableName, colName, val)
 	}
+	return make(map[string]float32)
 }
 
 func convertToFloat64Map(val interface{}, tableName, colName string) map[string]float64 {
 	switch v := val.(type) {
+	case map[string]float64:
+		return v
 	case map[string]interface{}:
-		result := make(map[string]float64)
+		result := make(map[string]float64, len(v))
 		for k, val := range v {
 			result[k] = convertToFloat64(val, tableName, colName)
 		}
 		return result
-	case map[string]float64:
-		return v
 	case string:
-		// Try to parse JSON string
-		var result map[string]interface{}
-		if err := json.Unmarshal([]byte(v), &result); err == nil {
-			float64Map := make(map[string]float64)
-			for k, val := range result {
-				float64Map[k] = convertToFloat64(val, tableName, colName)
+		var m map[string]interface{}
+		if err := json.Unmarshal([]byte(v), &m); err == nil {
+			result := make(map[string]float64, len(m))
+			for k, val := range m {
+				result[k] = convertToFloat64(val, tableName, colName)
 			}
-			return float64Map
+			return result
 		}
-		fmt.Println("Invalid map conversion from string", tableName, colName, v)
-		return make(map[string]float64)
+		fmt.Println("Invalid float64 map", tableName, colName, v)
 	default:
-		fmt.Println("Invalid col conversion to float64 map", tableName, colName, v)
-		return make(map[string]float64)
+		fmt.Println("Invalid float64 map", tableName, colName, val)
 	}
+	return make(map[string]float64)
 }

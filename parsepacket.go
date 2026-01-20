@@ -9,125 +9,104 @@ import (
 	"strings"
 )
 
-func parsePacket(x []byte) *ParsedPacket {
-	if x[0] != '{' {
-		//fmt.Println("Old log format:", string(x[:150]))
-		return parseOldPacket(string(x))
-	}
+var reColumnName = regexp.MustCompile("[^a-zA-Z0-9_]+")
 
-	var arbitrary_json map[string]interface{}
-	err := json.Unmarshal([]byte(x), &arbitrary_json)
-
-	if err != nil {
-		fmt.Println("Parse packet error", err)
+func parsePacket(data []byte) *ParsedPacket {
+	if len(data) == 0 {
+		fmt.Println("Empty packet")
 		return nil
 	}
 
-	if arbitrary_json == nil {
-		fmt.Println("Parse json returned nil")
-		return nil
+	if data[0] == '{' {
+		return parseJSONPacket(data)
 	}
-
-	tableName, tableNameOk := arbitrary_json["_t"].(string)
-	delete(arbitrary_json, "_t")
-
-	if !tableNameOk || tableName == "" {
-		fmt.Println("Table name is empty")
-		return nil
-	}
-
-	items := make([]ColValue, 0, len(arbitrary_json))
-
-	for columnName, v := range arbitrary_json {
-		items = append(items, ColValue{column: columnName, value: v})
-	}
-
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].column < items[j].column
-	})
-
-	columns := make([]string, 0, len(items))
-	for _, v := range items {
-		columns = append(columns, v.column)
-	}
-
-	values := make([]interface{}, 0, len(items))
-	for _, v := range items {
-		values = append(values, v.value)
-	}
-
-	return &ParsedPacket{
-		tableName: tableName,
-		columns:   columns,
-		values:    values,
-	}
+	return parseOldPacket(string(data))
 }
 
-var regColumnName = regexp.MustCompile("[^a-zA-Z_]+")
-
-func parseOldPacket(x string) *ParsedPacket {
-	if !strings.HasSuffix(x, "\n") {
-		fmt.Println("No newline at end")
+func parseJSONPacket(data []byte) *ParsedPacket {
+	var obj map[string]interface{}
+	if err := json.Unmarshal(data, &obj); err != nil {
+		fmt.Println("JSON parse error:", err)
+		return nil
+	}
+	if obj == nil {
+		fmt.Println("JSON returned nil")
 		return nil
 	}
 
-	x = strings.TrimSuffix(x, "\n")
+	tableName, ok := obj["_t"].(string)
+	delete(obj, "_t")
+	if !ok || tableName == "" {
+		fmt.Println("Missing table name")
+		return nil
+	}
 
-	parts := SplitWithEscaping(x, ",", "\\")
+	return buildPacket(tableName, obj)
+}
 
-	tableName := regColumnName.ReplaceAllString(parts[0], "")
+func parseOldPacket(data string) *ParsedPacket {
+	if !strings.HasSuffix(data, "\n") {
+		fmt.Println("Missing newline")
+		return nil
+	}
+	data = strings.TrimSuffix(data, "\n")
 
+	parts := SplitWithEscaping(data, ",", "\\")
+	if len(parts) == 0 {
+		fmt.Println("Empty parts")
+		return nil
+	}
+	tableName := reColumnName.ReplaceAllString(parts[0], "")
 	if tableName == "" {
-		fmt.Println("Table name is empty")
+		fmt.Println("Empty table name")
 		return nil
 	}
 
-	isColumn := true
-	columnName := ""
-	items := make([]ColValue, 0, (len(parts)-1)/2)
+	obj := make(map[string]interface{})
+	for i := 1; i+1 < len(parts); i += 2 {
+		colName := reColumnName.ReplaceAllString(parts[i], "")
+		rawVal := parts[i+1]
 
-	for _, v := range parts[1:] {
-		isString := strings.HasPrefix(v, "\"")
+		rawVal = strings.ReplaceAll(rawVal, "\\\"", "\x00")
+		isString := strings.HasPrefix(rawVal, "\"")
+		rawVal = strings.ReplaceAll(rawVal, "\"", "")
+		rawVal = strings.ReplaceAll(rawVal, "\x00", "\"")
 
-		v = strings.ReplaceAll(v, "\\\"", "\x00")
-		v = strings.ReplaceAll(v, "\"", "")
-		v = strings.ReplaceAll(v, "\x00", "\"")
-
-		if isColumn {
-			columnName = regColumnName.ReplaceAllString(v, "")
+		var val interface{}
+		if isString {
+			val = rawVal
+		} else if rawVal == "t" {
+			val = true
+		} else if rawVal == "f" {
+			val = false
+		} else if rawVal == "n" {
+			val = nil
+		} else if parsed, err := strconv.ParseFloat(rawVal, 64); err == nil {
+			val = parsed
 		} else {
-			if isString {
-				items = append(items, ColValue{column: columnName, value: v})
-			} else if v == "t" {
-				items = append(items, ColValue{column: columnName, value: true})
-			} else if v == "f" {
-				items = append(items, ColValue{column: columnName, value: false})
-			} else if v == "n" {
-				items = append(items, ColValue{column: columnName, value: nil})
-			} else {
-				parsed, err := strconv.ParseFloat(v, 64)
-				if err == nil {
-					items = append(items, ColValue{column: columnName, value: parsed})
-				} else {
-					fmt.Println("Old format col error", tableName, columnName)
-				}
-			}
+			fmt.Println("Parse error:", tableName, colName)
+			continue
 		}
-		isColumn = !isColumn
+		obj[colName] = val
 	}
 
+	return buildPacket(tableName, obj)
+}
+
+func buildPacket(tableName string, obj map[string]interface{}) *ParsedPacket {
+	items := make([]ColValue, 0, len(obj))
+	for col, val := range obj {
+		items = append(items, ColValue{column: col, value: val})
+	}
 	sort.Slice(items, func(i, j int) bool {
 		return items[i].column < items[j].column
 	})
 
-	columns := make([]string, 0, len(items))
-	for _, v := range items {
-		columns = append(columns, v.column)
-	}
-
-	values := make([]interface{}, 0, len(items))
-	for _, v := range items {
-		values = append(values, v.value)
+	columns := make([]string, len(items))
+	values := make([]interface{}, len(items))
+	for i, item := range items {
+		columns[i] = item.column
+		values[i] = item.value
 	}
 
 	return &ParsedPacket{
